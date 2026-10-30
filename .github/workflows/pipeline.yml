@@ -1,0 +1,78 @@
+name: pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m unittest discover -v
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        run: docker build --build-arg APP_VERSION=${{ github.sha }} -t app:ci .
+
+      - name: Smoke test the container
+        run: |
+          docker run -d --name app -p 8080:8080 --read-only --cap-drop ALL app:ci
+          for i in $(seq 1 20); do
+            curl -fs http://localhost:8080/health && exit 0
+            sleep 1
+          done
+          docker logs app
+          exit 1
+
+  infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+      - working-directory: infra
+        run: |
+          terraform fmt -check
+          terraform init -backend=false
+          terraform validate
+
+  # Runs only on main, and only once AWS has been set up (see README).
+  # Without the AWS_ROLE_ARN variable the job is skipped, so forks and PRs stay green.
+  deploy:
+    needs: [image, infra]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          build-args: APP_VERSION=${{ github.sha }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
